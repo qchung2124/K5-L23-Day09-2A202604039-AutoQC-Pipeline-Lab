@@ -27,3 +27,108 @@ from ..common import ERROR, WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
 def run(ds, cfg):
     # TODO: duyệt từng file nhãn, từng dòng
     raise NotImplementedError("check label_format chưa làm")
+
+
+
+def run(ds, cfg):
+    lf_cfg = cfg["label_format"]
+    overflow_tol = lf_cfg["overflow_tol"]
+    dup_box_iou = lf_cfg["dup_box_iou"]
+    min_box_px = lf_cfg["min_box_px"]
+    max_box_frac = lf_cfg["max_box_frac"]
+    num_classes = len(ds.classes)
+
+    issues: list[Issue] = []
+
+    for lbl_path in ds.label_files():
+        stem = lbl_path.stem
+        lines = ds.read_label_lines(stem)
+        if not lines:
+            continue
+
+        img_size = ds.image_size(stem)
+        seen_boxes: list[tuple[int, float, float, float, float]] = []
+
+        for line_no, text in lines:
+            # 1. Kiểm tra định dạng 5 cột số
+            try:
+                cls_id, cx, cy, w, h = parse_yolo_line(text)
+            except ValueError as e:
+                issues.append(
+                    Issue("label_format", ERROR, "BAD_FORMAT", stem, f"lỗi cú pháp: {e}", line=line_no)
+                )
+                continue
+
+            # 2. Kiểm tra ID lớp hợp lệ
+            if not (0 <= cls_id < num_classes):
+                issues.append(
+                    Issue("label_format", ERROR, "BAD_CLASS_ID", stem, f"id lớp không hợp lệ: {cls_id}", line=line_no)
+                )
+                continue
+
+            # 3. Kiểm tra kích thước rộng/cao <= 0
+            if w <= 0 or h <= 0:
+                issues.append(
+                    Issue("label_format", ERROR, "BOX_ZERO", stem, f"kích thước box <= 0 (w={w}, h={h})", line=line_no)
+                )
+                continue
+
+            # 4. Kiểm tra tràn ra ngoài biên [0, 1] vượt quá overflow_tol
+            x1, y1 = cx - w / 2.0, cy - h / 2.0
+            x2, y2 = cx + w / 2.0, cy + h / 2.0
+            overflow = max(0.0 - x1, 0.0 - y1, x2 - 1.0, y2 - 1.0, 0.0)
+            if overflow > overflow_tol:
+                issues.append(
+                    Issue(
+                        "label_format",
+                        ERROR,
+                        "BOX_OUT_OF_IMAGE",
+                        stem,
+                        f"box tràn ảnh {overflow:.4f}",
+                        line=line_no,
+                        extra={"overflow": round(overflow, 6)},
+                    )
+                )
+
+            # 5. Kiểm tra box trùng lặp với dòng trước đó (cùng lớp và IoU > dup_box_iou)
+            curr_box = (cx, cy, w, h)
+            is_dup = any(
+                prev_cls == cls_id and iou_xywh(prev_box, curr_box) > dup_box_iou
+                for prev_cls, *prev_box in seen_boxes
+            )
+            if is_dup:
+                issues.append(
+                    Issue("label_format", ERROR, "DUP_BOX", stem, "box trùng lặp với dòng trước đó", line=line_no)
+                )
+            seen_boxes.append((cls_id, cx, cy, w, h))
+
+            # 6. Cảnh báo box quá nhỏ theo pixel (cần biết kích thước ảnh)
+            if img_size is not None:
+                img_w, img_h = img_size
+                short_side_px = min(w * img_w, h * img_h)
+                if short_side_px < min_box_px:
+                    issues.append(
+                        Issue(
+                            "label_format",
+                            WARN,
+                            "BOX_TINY",
+                            stem,
+                            f"cạnh ngắn box quá nhỏ ({short_side_px:.1f}px < {min_box_px}px)",
+                            line=line_no,
+                        )
+                    )
+
+            # 7. Cảnh báo box chiếm diện tích quá lớn
+            if w * h > max_box_frac:
+                issues.append(
+                    Issue(
+                        "label_format",
+                        WARN,
+                        "BOX_HUGE",
+                        stem,
+                        f"diện tích box quá lớn ({w * h:.3f} > {max_box_frac})",
+                        line=line_no,
+                    )
+                )
+
+    return issues
